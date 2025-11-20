@@ -1,0 +1,183 @@
+name: Deploy DeFi Data Agent to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'agent/cambrian-defi-data-agent.js'
+      - 'agent/ipfs-storage.js'
+      - 'agent/package.json'
+      - 'agent/package-lock.json'
+      - '.github/workflows/deploy-cloud-run.yaml'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Deployment reason'
+        required: false
+        default: 'Manual deployment'
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  SERVICE_NAME: erc8004-cambrian-defi-data
+  IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/cambrian-defi-data-agent
+
+jobs:
+  deploy:
+    name: Deploy to Cloud Run
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for GCR
+        run: |
+          gcloud auth configure-docker
+
+      - name: Build Docker image
+        working-directory: ./agent
+        run: |
+          echo "🏗️ Building Docker image..."
+
+          # Create Dockerfile if it doesn't exist
+          cat > Dockerfile <<'EOF'
+          FROM node:18-slim
+
+          # Install Python and required packages
+          RUN apt-get update && apt-get install -y \
+            python3 \
+            python3-pip \
+            && rm -rf /var/lib/apt/lists/*
+
+          # Set working directory
+          WORKDIR /app
+
+          # Copy package files
+          COPY package*.json ./
+
+          # Install Node.js dependencies
+          RUN npm install --omit=dev --legacy-peer-deps --no-audit --no-fund
+
+          # Copy Python ADK files and install dependencies
+          COPY python_adk/ ./python_adk/
+          RUN if [ -f python_adk/requirements.txt ]; then pip3 install --no-cache-dir --break-system-packages -r python_adk/requirements.txt; fi
+
+          # Copy application code
+          COPY cambrian-defi-data-agent.js .
+          COPY ipfs-storage.js .
+
+          # Expose port
+          EXPOSE 8080
+
+          # Set environment variable for port
+          ENV PORT=8080
+          ENV NODE_ENV=production
+
+          # Start the agent
+          CMD ["node", "cambrian-defi-data-agent.js"]
+          EOF
+
+          # Build image
+          docker build -t ${IMAGE_NAME}:${GITHUB_SHA} .
+          docker tag ${IMAGE_NAME}:${GITHUB_SHA} ${IMAGE_NAME}:latest
+
+      - name: Push Docker image to GCR
+        run: |
+          echo "📤 Pushing image to Google Container Registry..."
+          docker push ${IMAGE_NAME}:${GITHUB_SHA}
+          docker push ${IMAGE_NAME}:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          echo "🚀 Deploying to Cloud Run..."
+
+          gcloud run deploy ${SERVICE_NAME} \
+            --image ${IMAGE_NAME}:${GITHUB_SHA} \
+            --region ${GCP_REGION} \
+            --platform managed \
+            --allow-unauthenticated \
+            --memory 1Gi \
+            --cpu 1 \
+            --timeout 300 \
+            --max-instances 10 \
+            --min-instances 0 \
+            --port 8080 \
+            --set-env-vars="NODE_ENV=production,BYPASS_PAYMENT=true,MCP_SERVER_URL=http://136.115.87.101:8081" \
+            --set-secrets="CAMBRIAN_API_KEY=CAMBRIAN_API_KEY:latest,AGENT_PRIVATE_KEY=SELLER_PRIVATE_KEY:latest,BASE_SEPOLIA_RPC=RPC_URL:latest,PINATA_API_KEY=PINATA_API_KEY:latest,PINATA_SECRET_KEY=PINATA_SECRET_KEY:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest"
+
+      - name: Get service URL
+        id: get-url
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${SERVICE_NAME} \
+            --region ${GCP_REGION} \
+            --format 'value(status.url)')
+          echo "SERVICE_URL=${SERVICE_URL}" >> $GITHUB_OUTPUT
+          echo "🌐 Service URL: ${SERVICE_URL}"
+
+      - name: Test deployment
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.SERVICE_URL }}"
+
+          echo "🧪 Testing health endpoint..."
+          HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/health" | tail -1)
+
+          if [ "$HEALTH_RESPONSE" = "200" ]; then
+            echo "✅ Health check passed"
+          else
+            echo "❌ Health check failed with status: $HEALTH_RESPONSE"
+            exit 1
+          fi
+
+      - name: Create deployment summary
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.SERVICE_URL }}"
+
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## 🚀 Cloud Run Deployment Successful!
+
+          ### 📍 Service Details
+          - **Service Name**: ${SERVICE_NAME}
+          - **Region**: ${GCP_REGION}
+          - **Image**: ${IMAGE_NAME}:${GITHUB_SHA}
+          - **URL**: ${SERVICE_URL}
+
+          ### 🔗 Endpoints
+          - **Health Check**: ${SERVICE_URL}/health
+          - **Agent Card**: ${SERVICE_URL}/.well-known/agent-card.json
+          - **Price Current**: ${SERVICE_URL}/api/price-current
+          - **Price Multi**: ${SERVICE_URL}/api/price-multi
+          - **OHLCV Data**: ${SERVICE_URL}/api/ohlcv
+
+          ### ✅ Configuration
+          - **CORS**: Configured for https://erc8004-ui.rickycambrian.org
+          - **Payment**: Bypass enabled (testnet)
+          - **Memory**: 1GB
+          - **CPU**: 1
+          - **Max Instances**: 10
+
+          ### 🧪 Test Command
+          \`\`\`bash
+          curl -X POST ${SERVICE_URL}/api/price-current \\
+            -H 'Content-Type: application/json' \\
+            -d '{"token_address":"So11111111111111111111111111111111111111112"}'
+          \`\`\`
+
+          ---
+          *Deployed from commit ${GITHUB_SHA}*
+          EOF

@@ -1,0 +1,29 @@
+{
+  "agent_id": "1",
+  "domain": "tee-agent.base",
+  "rpc_endpoint": "https://sepolia.base.org",
+  "contracts": {
+    "identity_registry": "0x8004AA63c570c570eBF15376c0dB199918BFe9Fb",
+    "reputation_registry": "0x8004bd8daB57f14Ed299135749a5CB5c42d341BF",
+    "validation_registry": "0x8004C269D0A5647E51E121FeB226200ECE932d55",
+    "service_registry": ""
+  },
+  "plugins": {
+    "cambrian": {
+      "enabled": true,
+      "api_url": "https://api.cambrian.network",
+      "api_key": "YOUR_CAMBRIAN_API_KEY_HERE"
+    },
+    "janusgraph": {
+      "enabled": true,
+      "url": "http://janusgraph:8000",
+      "graphql_url": "http://janusgraph:8002/graphql"
+    }
+  },
+  "tee_config": {
+    "provider": "gcp_confidential_space",
+    "enable_attestation": true,
+    "enable_ekm": true,
+    "log_redirect": true
+  }
+}

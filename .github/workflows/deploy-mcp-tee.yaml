@@ -1,0 +1,428 @@
+name: Deploy MCP Server TEE to GCP Confidential Space
+
+# Trigger Conditions:
+# - Runs on push to main when MCP server files change
+# - Skip deployment by adding [skip mcp] to commit message
+# - Manual trigger available
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'mcp-server/**'
+      - '.github/workflows/deploy-mcp-tee.yaml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'mcp-server/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  SERVICE_NAME: cambrian-mcp-server-tee
+  INSTANCE_NAME: cambrian-mcp-tee-prod  # Fixed name (not timestamped)
+  STATIC_IP_NAME: cambrian-mcp-tee-ip   # Static IP name
+
+jobs:
+  # Job 1: Build and validate MCP Server TEE
+  build-and-validate:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go 1.21
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.21'
+
+    - name: Set up Node.js 20
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Validate Go modules
+      run: |
+        cd mcp-server/deployment
+        go mod verify
+        go mod tidy -v
+        echo "✅ Go modules validated"
+
+    - name: Test Go bootstrap compilation
+      run: |
+        cd mcp-server/deployment
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bootstrap-test ./bootstrap.go
+        echo "✅ Bootstrap compiles successfully"
+        rm bootstrap-test
+
+    - name: Validate TypeScript syntax
+      run: |
+        cd mcp-server
+        npm install
+        npm run build
+        echo "✅ TypeScript compiles successfully"
+
+    - name: Test Dockerfile.tee builds
+      run: |
+        docker build \
+          --platform linux/amd64 \
+          --target go-builder \
+          -f mcp-server/deployment/Dockerfile.tee \
+          -t mcp-tee-test:build \
+          .
+        echo "✅ Dockerfile.tee builds successfully"
+
+    - name: Security scan
+      run: |
+        echo "Running security checks..."
+
+        # Check for hardcoded secrets (exclude Secret Manager paths and env vars)
+        if grep -rE "(private.*key|password).*=.*['\"][^/]" mcp-server/deployment/*.go mcp-server/src/*.ts 2>/dev/null | grep -v "process.env" | grep -v "SECRET_MANAGER" | grep -v "secretPath"; then
+          echo "❌ Potential hardcoded secrets found"
+          exit 1
+        fi
+
+        # Check for actual secret values (not variable names)
+        if grep -rE "Bearer [a-zA-Z0-9]{20,}|sk-[a-zA-Z0-9]{20,}" mcp-server/deployment/*.go mcp-server/src/*.ts 2>/dev/null; then
+          echo "❌ Hardcoded API keys or tokens found"
+          exit 1
+        fi
+
+        echo "✅ Security scan completed"
+
+  # Job 2: Build and deploy MCP Server TEE
+  deploy-mcp-tee:
+    needs: build-and-validate
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip mcp]')
+
+    outputs:
+      instance-ip: ${{ steps.deploy.outputs.instance-ip }}
+      instance-name: ${{ steps.deploy.outputs.instance-name }}
+      container-digest: ${{ steps.build.outputs.container-digest }}
+      image-uri: ${{ steps.build.outputs.image-uri }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Authenticate with Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_DEPLOY_SA }}
+
+    - name: Set up Google Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+      with:
+        project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+    - name: Configure Docker for GCR
+      run: |
+        gcloud auth configure-docker gcr.io
+
+    - name: Build MCP Server TEE Docker image
+      id: build
+      run: |
+        IMAGE_TAG="${GITHUB_SHA::8}"
+        IMAGE_URI="gcr.io/${{ secrets.GCP_PROJECT_ID }}/${SERVICE_NAME}:${IMAGE_TAG}"
+
+        echo "Building MCP Server TEE image: $IMAGE_URI"
+
+        export SOURCE_DATE_EPOCH=0
+        export DOCKER_BUILDKIT=1
+
+        docker build \
+          --platform linux/amd64 \
+          --build-arg SOURCE_DATE_EPOCH=0 \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --build-arg GIT_COMMIT=${GITHUB_SHA} \
+          --build-arg GIT_BRANCH=${GITHUB_REF_NAME} \
+          --build-arg BUILD_TIMESTAMP=$(date -u +%s) \
+          --build-arg BUILD_NUMBER=${GITHUB_RUN_NUMBER} \
+          --build-arg GIT_REPOSITORY=${GITHUB_REPOSITORY} \
+          -f mcp-server/deployment/Dockerfile.tee \
+          -t "$IMAGE_URI" \
+          -t "gcr.io/${{ secrets.GCP_PROJECT_ID }}/${SERVICE_NAME}:latest" \
+          .
+
+        echo "✅ Docker image built"
+
+        docker push "$IMAGE_URI"
+        docker push "gcr.io/${{ secrets.GCP_PROJECT_ID }}/${SERVICE_NAME}:latest"
+
+        CONTAINER_DIGEST=$(docker inspect "$IMAGE_URI" --format='{{index .RepoDigests 0}}' | cut -d'@' -f2)
+
+        echo "✅ Images pushed to registry"
+        echo "   Image URI: $IMAGE_URI"
+        echo "   Container Digest: $CONTAINER_DIGEST"
+
+        echo "image-uri=$IMAGE_URI" >> $GITHUB_OUTPUT
+        echo "container-digest=$CONTAINER_DIGEST" >> $GITHUB_OUTPUT
+        echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+        echo "CONTAINER_DIGEST=$CONTAINER_DIGEST" >> $GITHUB_ENV
+
+    - name: Create or Get Static IP
+      id: static-ip
+      run: |
+        echo "Ensuring static IP exists: ${STATIC_IP_NAME}"
+
+        if gcloud compute addresses describe "${STATIC_IP_NAME}" \
+          --region=$(echo ${{ secrets.GCP_ZONE }} | sed 's/-[a-z]$//') \
+          --format='get(address)' 2>/dev/null; then
+          STATIC_IP=$(gcloud compute addresses describe "${STATIC_IP_NAME}" \
+            --region=$(echo ${{ secrets.GCP_ZONE }} | sed 's/-[a-z]$//') \
+            --format='get(address)')
+          echo "✅ Static IP already exists: $STATIC_IP"
+        else
+          gcloud compute addresses create "${STATIC_IP_NAME}" \
+            --region=$(echo ${{ secrets.GCP_ZONE }} | sed 's/-[a-z]$//')
+
+          STATIC_IP=$(gcloud compute addresses describe "${STATIC_IP_NAME}" \
+            --region=$(echo ${{ secrets.GCP_ZONE }} | sed 's/-[a-z]$//') \
+            --format='get(address)')
+          echo "✅ Static IP created: $STATIC_IP"
+        fi
+
+        echo "static-ip=$STATIC_IP" >> $GITHUB_OUTPUT
+        echo "STATIC_IP=$STATIC_IP" >> $GITHUB_ENV
+
+    - name: Delete Old Instance (if exists)
+      run: |
+        echo "Checking for existing instance: ${INSTANCE_NAME}"
+
+        if gcloud compute instances describe "${INSTANCE_NAME}" \
+          --zone=${{ secrets.GCP_ZONE }} &> /dev/null; then
+          echo "⚠️  Old instance exists, deleting..."
+          gcloud compute instances delete "${INSTANCE_NAME}" \
+            --zone=${{ secrets.GCP_ZONE }} \
+            --quiet
+          echo "✅ Old instance deleted"
+          sleep 10
+        else
+          echo "✅ No old instance to delete"
+        fi
+
+    - name: Deploy GCE Confidential Space VM
+      id: deploy
+      run: |
+        echo "Deploying MCP Server TEE to GCE Confidential Space..."
+        echo "Configuration:"
+        echo "  Instance: ${INSTANCE_NAME}"
+        echo "  Static IP: ${STATIC_IP}"
+        echo "  Port: 8081"
+        echo "  Zone: ${{ secrets.GCP_ZONE }}"
+        echo "  Container Digest: ${CONTAINER_DIGEST}"
+
+        gcloud compute instances create "${INSTANCE_NAME}" \
+          --zone=${{ secrets.GCP_ZONE }} \
+          --machine-type=n2d-standard-2 \
+          --network-interface=network-tier=PREMIUM,stack-type=IPV4_ONLY,subnet=default,address="${STATIC_IP}" \
+          --maintenance-policy=TERMINATE \
+          --provisioning-model=STANDARD \
+          --service-account=erc8004-tee-sa@${{ secrets.GCP_PROJECT_ID }}.iam.gserviceaccount.com \
+          --scopes=https://www.googleapis.com/auth/cloud-platform \
+          --confidential-compute-type=SEV \
+          --shielded-secure-boot \
+          --shielded-vtpm \
+          --shielded-integrity-monitoring \
+          --image=confidential-space-250101 \
+          --image-project=confidential-space-images \
+          --boot-disk-size=15GB \
+          --boot-disk-type=pd-balanced \
+          --metadata=^~^tee-image-reference=${IMAGE_URI}~tee-restart-policy=Always~tee-env-TEE_MODE=true~tee-env-NODE_ENV=production~tee-env-CONTAINER_DIGEST=${CONTAINER_DIGEST}~tee-env-GCP_PROJECT_ID=${{ secrets.GCP_PROJECT_ID }}~tee-env-PORT=8081 \
+          --labels=workload=mcp-server-tee,version=production,environment=prod,security-level=maximum \
+          --tags=tee-vm,mcp-server
+
+        echo "instance-ip=${STATIC_IP}" >> $GITHUB_OUTPUT
+        echo "instance-name=${INSTANCE_NAME}" >> $GITHUB_OUTPUT
+        echo "INSTANCE_IP=${STATIC_IP}" >> $GITHUB_ENV
+
+        echo "✅ MCP Server TEE deployed"
+        echo "   Instance: ${INSTANCE_NAME}"
+        echo "   Static IP: ${STATIC_IP}"
+
+        sleep 30
+
+    - name: Wait for MCP Server to start
+      run: |
+        echo "Waiting for MCP Server to initialize..."
+
+        for i in {1..30}; do
+          echo "Health check attempt $i/30..."
+
+          if curl -f --max-time 10 "http://${INSTANCE_IP}:8081/health" 2>/dev/null; then
+            echo "✅ MCP Server is healthy and responding"
+
+            HEALTH_RESPONSE=$(curl -s "http://${INSTANCE_IP}:8081/health")
+            echo "Health response: $HEALTH_RESPONSE"
+
+            if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
+              echo "✅ Full initialization complete"
+              break
+            fi
+          else
+            if [ $i -eq 30 ]; then
+              echo "❌ MCP Server failed to start after 10 minutes"
+              gcloud compute instances get-serial-port-output "$INSTANCE_NAME" \
+                --zone=${{ secrets.GCP_ZONE }} --port=1 | tail -100 || true
+              exit 1
+            fi
+            echo "Waiting 30 seconds..."
+            sleep 30
+          fi
+        done
+
+    - name: Save deployment information
+      run: |
+        mkdir -p deployment-artifacts
+
+        cat > deployment-artifacts/mcp-tee-deployment.json << EOF
+        {
+          "deployment": {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "instance_name": "${INSTANCE_NAME}",
+            "instance_ip": "${STATIC_IP}",
+            "static_ip_name": "${STATIC_IP_NAME}",
+            "image": "${IMAGE_URI}",
+            "container_digest": "${CONTAINER_DIGEST}",
+            "commit_sha": "${GITHUB_SHA}",
+            "zone": "${{ secrets.GCP_ZONE }}",
+            "machine_type": "n2d-standard-2",
+            "security_level": "MAXIMUM",
+            "tee_mode": "FULL_TEE"
+          },
+          "endpoints": {
+            "health": "http://${INSTANCE_IP}:8081/health",
+            "attestation": "http://${INSTANCE_IP}:8081/attestation",
+            "mcp": "http://${INSTANCE_IP}:8081/mcp",
+            "root": "http://${INSTANCE_IP}:8081/"
+          }
+        }
+        EOF
+
+        echo "✅ Deployment information saved"
+        cat deployment-artifacts/mcp-tee-deployment.json
+
+    - name: Upload deployment artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: mcp-tee-deployment-info
+        path: deployment-artifacts/
+        retention-days: 90
+
+  # Job 3: Verify MCP Server TEE
+  verify-mcp-tee:
+    needs: deploy-mcp-tee
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && !contains(github.event.head_commit.message, '[skip mcp]')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Test health endpoint
+      run: |
+        INSTANCE_IP="${{ needs.deploy-mcp-tee.outputs.instance-ip }}"
+
+        echo "Testing health endpoint: http://${INSTANCE_IP}:8081/health"
+        HEALTH_RESPONSE=$(curl -s "http://${INSTANCE_IP}:8081/health")
+
+        echo "Health response:"
+        echo "$HEALTH_RESPONSE" | jq '.' || echo "$HEALTH_RESPONSE"
+
+        if echo "$HEALTH_RESPONSE" | grep -q "healthy"; then
+          echo "✅ Health check passed"
+        else
+          echo "❌ Health check failed"
+          exit 1
+        fi
+
+    - name: Test attestation endpoint
+      run: |
+        INSTANCE_IP="${{ needs.deploy-mcp-tee.outputs.instance-ip }}"
+
+        echo "Testing attestation endpoint: http://${INSTANCE_IP}:8081/attestation"
+        ATTESTATION_RESPONSE=$(curl -s "http://${INSTANCE_IP}:8081/attestation")
+
+        echo "Attestation response:"
+        echo "$ATTESTATION_RESPONSE" | jq '.' || echo "$ATTESTATION_RESPONSE"
+
+        if echo "$ATTESTATION_RESPONSE" | grep -q "attestation"; then
+          echo "✅ Attestation endpoint working"
+        else
+          echo "⚠️  Attestation may not be fully configured"
+        fi
+
+    - name: Test MCP tools endpoint
+      run: |
+        INSTANCE_IP="${{ needs.deploy-mcp-tee.outputs.instance-ip }}"
+
+        echo "Testing MCP tools endpoint"
+
+        # Need to provide API key
+        TOOLS_REQUEST='{"jsonrpc":"2.0","method":"tools/list","params":{},"id":1}'
+
+        TOOLS_RESPONSE=$(curl -s -X POST "http://${INSTANCE_IP}:8081/mcp" \
+          -H "Content-Type: application/json" \
+          -H "Authorization: Bearer test-key-for-ci" \
+          -d "$TOOLS_REQUEST")
+
+        echo "Tools response:"
+        echo "$TOOLS_RESPONSE" | jq '.' || echo "$TOOLS_RESPONSE"
+
+        TOOL_COUNT=$(echo "$TOOLS_RESPONSE" | jq -r '.result.tools | length // 0')
+
+        if [ "$TOOL_COUNT" -gt 60 ]; then
+          echo "✅ MCP server has $TOOL_COUNT tools available"
+        else
+          echo "⚠️  Expected 68+ tools, got $TOOL_COUNT"
+        fi
+
+    - name: Create deployment summary
+      run: |
+        INSTANCE_IP="${{ needs.deploy-mcp-tee.outputs.instance-ip }}"
+        INSTANCE_NAME="${{ needs.deploy-mcp-tee.outputs.instance-name }}"
+        CONTAINER_DIGEST="${{ needs.deploy-mcp-tee.outputs.container-digest }}"
+
+        echo "## 🔒 MCP Server TEE Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🚀 Instance Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Instance Name:** ${INSTANCE_NAME}" >> $GITHUB_STEP_SUMMARY
+        echo "- **External IP:** ${INSTANCE_IP}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Port:** 8081" >> $GITHUB_STEP_SUMMARY
+        echo "- **Zone:** ${{ secrets.GCP_ZONE }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Machine Type:** n2d-standard-2 (AMD SEV)" >> $GITHUB_STEP_SUMMARY
+        echo "- **Security Level:** MAXIMUM (Full TEE)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔐 Security Properties" >> $GITHUB_STEP_SUMMARY
+        echo "- **Platform:** GCP Confidential Space" >> $GITHUB_STEP_SUMMARY
+        echo "- **Execution:** Hardware-isolated AMD SEV memory" >> $GITHUB_STEP_SUMMARY
+        echo "- **Container Digest:** \`${CONTAINER_DIGEST}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Reproducible Builds:** Enabled" >> $GITHUB_STEP_SUMMARY
+        echo "- **Hardware Attestation:** Google-signed JWT" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📡 Endpoints" >> $GITHUB_STEP_SUMMARY
+        echo "- **Health Check:** http://${INSTANCE_IP}:8081/health" >> $GITHUB_STEP_SUMMARY
+        echo "- **Attestation:** http://${INSTANCE_IP}:8081/attestation" >> $GITHUB_STEP_SUMMARY
+        echo "- **MCP Tools:** http://${INSTANCE_IP}:8081/mcp" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Features" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ 68+ Cambrian API tools" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Complete execution logging" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ TLS certificate capture" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ TEE attestation available" >> $GITHUB_STEP_SUMMARY
+        echo "- ✅ Request/response hashing" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "*Deployed with ❤️ by Cambrian ERC-8004 TEE System*" >> $GITHUB_STEP_SUMMARY

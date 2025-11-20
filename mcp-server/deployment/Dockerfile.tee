@@ -1,0 +1,128 @@
+# TEE MCP Server for GCP Confidential Space
+#
+# This Dockerfile creates a TEE container for the MCP server where execution happens in
+# hardware-isolated memory (AMD SEV). The server provides 68+ Cambrian API tools with
+# complete execution logging and TEE attestation.
+#
+# Security Properties:
+# - Proves exact code version executed
+# - Logs all tool executions with request/response hashes
+# - Captures TLS certificates from API calls
+# - Provides TEE attestation endpoint
+# - Hardware-attested execution
+
+# ============================================================================
+# Build Arguments for Source Verification
+# ============================================================================
+ARG SOURCE_DATE_EPOCH=0
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=0
+ARG BUILD_NUMBER=0
+ARG GIT_REPOSITORY=unknown
+
+# ============================================================================
+# Stage 1: Build Go bootstrap supervisor
+# ============================================================================
+FROM golang:1.21-alpine AS go-builder
+
+# Install build dependencies
+RUN apk add --no-cache git make build-base ca-certificates
+
+WORKDIR /build
+
+# Copy go module files
+COPY mcp-server/deployment/go.mod mcp-server/deployment/go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY mcp-server/deployment/*.go ./
+
+# Build bootstrap with reproducible flags
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-w -s -buildid=" \
+    -trimpath \
+    -o /bootstrap \
+    ./bootstrap.go
+
+# ============================================================================
+# Stage 2: Build Node.js MCP server
+# ============================================================================
+FROM node:18-alpine AS node-builder
+
+WORKDIR /app
+
+# Copy package files
+COPY mcp-server/package*.json ./
+COPY mcp-server/tsconfig.json ./
+
+# Install all dependencies (including TypeScript for build)
+RUN npm ci --ignore-scripts
+
+# Copy source code
+COPY mcp-server/src ./src
+
+# Build TypeScript
+RUN npm run build
+
+# Remove devDependencies after build
+RUN npm prune --production
+
+# ============================================================================
+# Stage 3: Production TEE container
+# ============================================================================
+FROM alpine:3.19
+
+# Re-declare build args
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=0
+ARG BUILD_NUMBER=0
+ARG GIT_REPOSITORY=unknown
+
+# Set build metadata
+ENV GIT_COMMIT=${GIT_COMMIT} \
+    GIT_BRANCH=${GIT_BRANCH} \
+    BUILD_TIMESTAMP=${BUILD_TIMESTAMP} \
+    BUILD_NUMBER=${BUILD_NUMBER} \
+    GIT_REPOSITORY=${GIT_REPOSITORY}
+
+# Confidential Space metadata labels
+LABEL "tee.launch_policy.allow_cmd_override"="false"
+LABEL "tee.launch_policy.log_redirect"="always"
+LABEL "tee.launch_policy.allow_env_override"="SERVER_CAMBRIAN_API_KEY,PORT,TEE_MODE,NODE_ENV,CONTAINER_DIGEST,GCP_PROJECT_ID"
+
+# Install runtime dependencies
+RUN apk add --no-cache nodejs npm ca-certificates && \
+    addgroup -g 1000 teemcp && \
+    adduser -D -u 1000 -G teemcp teemcp
+
+# Copy Go bootstrap
+COPY --from=go-builder /bootstrap /bootstrap
+
+# Copy Node.js server
+COPY --from=node-builder /app/dist /app/dist
+COPY --from=node-builder /app/node_modules /app/node_modules
+COPY --from=node-builder /app/package.json /app/package.json
+
+# Create required directories
+RUN mkdir -p /app/logs && \
+    chown -R teemcp:teemcp /app
+
+# NOTE: bootstrap runs as root for socket access
+# It will exec to Node.js which runs as the container's default user
+
+WORKDIR /app
+
+# Expose MCP server port
+EXPOSE 8081
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8081/health || exit 1
+
+# Entry point is the Go bootstrap supervisor
+ENTRYPOINT ["/bootstrap"]
+
+# Default arguments for bootstrap
+CMD ["--port=8081"]

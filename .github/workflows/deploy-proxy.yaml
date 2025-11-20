@@ -1,0 +1,180 @@
+name: Deploy TEE Proxy to Cloud Run
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'proxy/**'
+      - '.github/workflows/deploy-proxy.yaml'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Deployment reason'
+        required: false
+        default: 'Manual deployment'
+
+env:
+  GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  GCP_REGION: us-central1
+  SERVICE_NAME: erc8004-tee-proxy
+  IMAGE_NAME: gcr.io/${{ secrets.GCP_PROJECT_ID }}/erc8004-tee-proxy
+
+jobs:
+  deploy:
+    name: Deploy Proxy to Cloud Run
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_DEPLOY_SA }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Configure Docker for GCR
+        run: |
+          gcloud auth configure-docker
+
+      - name: Build Docker image
+        working-directory: ./proxy
+        run: |
+          echo "🏗️ Building proxy Docker image..."
+          docker build -t ${IMAGE_NAME}:${GITHUB_SHA} .
+          docker tag ${IMAGE_NAME}:${GITHUB_SHA} ${IMAGE_NAME}:latest
+
+      - name: Push Docker image to GCR
+        run: |
+          echo "📤 Pushing image to Google Container Registry..."
+          docker push ${IMAGE_NAME}:${GITHUB_SHA}
+          docker push ${IMAGE_NAME}:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          echo "🚀 Deploying proxy to Cloud Run..."
+
+          gcloud run deploy ${SERVICE_NAME} \
+            --image ${IMAGE_NAME}:${GITHUB_SHA} \
+            --region ${GCP_REGION} \
+            --platform managed \
+            --no-invoker-iam-check \
+            --memory 512Mi \
+            --cpu 1 \
+            --timeout 60 \
+            --max-instances 10 \
+            --min-instances 0 \
+            --port 8090 \
+            --set-env-vars="NODE_ENV=production,AGENT_TEE_URL=http://34.171.64.112:8080,MCP_SERVER_TEE_URL=http://136.115.87.101:8081"
+
+      - name: Get service URL
+        id: get-url
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${SERVICE_NAME} \
+            --region ${GCP_REGION} \
+            --format 'value(status.url)')
+          echo "SERVICE_URL=${SERVICE_URL}" >> $GITHUB_OUTPUT
+          echo "🌐 Service URL: ${SERVICE_URL}"
+
+      - name: Test deployment
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.SERVICE_URL }}"
+
+          echo "🧪 Testing proxy health endpoint..."
+          HEALTH_RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/health" | tail -1)
+
+          if [ "$HEALTH_RESPONSE" = "200" ]; then
+            echo "✅ Health check passed"
+          else
+            echo "❌ Health check failed with status: $HEALTH_RESPONSE"
+            exit 1
+          fi
+
+          echo "🧪 Testing Agent TEE proxy..."
+          AGENT_RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/agent/health" | tail -1)
+
+          if [ "$AGENT_RESPONSE" = "200" ]; then
+            echo "✅ Agent TEE proxy working"
+          else
+            echo "❌ Agent TEE proxy failed with status: $AGENT_RESPONSE"
+            exit 1
+          fi
+
+          echo "🧪 Testing MCP Server proxy..."
+          MCP_RESPONSE=$(curl -s -w "\n%{http_code}" "${SERVICE_URL}/mcp/health" | tail -1)
+
+          if [ "$MCP_RESPONSE" = "200" ]; then
+            echo "✅ MCP Server proxy working"
+          else
+            echo "❌ MCP Server proxy failed with status: $MCP_RESPONSE"
+            exit 1
+          fi
+
+      - name: Create deployment summary
+        run: |
+          SERVICE_URL="${{ steps.get-url.outputs.SERVICE_URL }}"
+
+          cat >> $GITHUB_STEP_SUMMARY <<EOF
+          ## 🚀 TEE Proxy Deployment Successful!
+
+          ### 📍 Service Details
+          - **Service Name**: ${SERVICE_NAME}
+          - **Region**: ${GCP_REGION}
+          - **Image**: ${IMAGE_NAME}:${GITHUB_SHA}
+          - **URL**: ${SERVICE_URL}
+
+          ### 🔗 Proxy Endpoints
+
+          #### Agent TEE Proxy
+          - **Health**: \`${SERVICE_URL}/agent/health\`
+          - **Attestation**: \`${SERVICE_URL}/agent/attestation\`
+          - **AI Queries**: \`${SERVICE_URL}/agent/api/ask\`
+          - **Price Data**: \`${SERVICE_URL}/agent/api/price-current\`
+          - **OHLCV**: \`${SERVICE_URL}/agent/api/ohlcv\`
+
+          #### MCP Server TEE Proxy
+          - **Health**: \`${SERVICE_URL}/mcp/health\`
+          - **Attestation**: \`${SERVICE_URL}/mcp/attestation\`
+          - **Tools**: \`${SERVICE_URL}/mcp/tools\`
+          - **Execute**: \`${SERVICE_URL}/mcp/execute\`
+
+          ### ✅ Configuration
+          - **CORS**: Enabled for UI domains
+          - **Memory**: 512MB
+          - **CPU**: 1
+          - **Max Instances**: 10
+          - **Timeout**: 60 seconds
+
+          ### 🧪 Test Commands
+
+          #### Test Agent TEE Health
+          \`\`\`bash
+          curl ${SERVICE_URL}/agent/health
+          \`\`\`
+
+          #### Test AI Query (requires API key)
+          \`\`\`bash
+          curl -X POST ${SERVICE_URL}/agent/api/ask \\
+            -H 'Content-Type: application/json' \\
+            -H 'X-Cambrian-Api-Key: YOUR_API_KEY' \\
+            -d '{"question":"What is the price of SOL?"}'
+          \`\`\`
+
+          #### Test MCP Tools
+          \`\`\`bash
+          curl ${SERVICE_URL}/mcp/tools
+          \`\`\`
+
+          ---
+          *Deployed from commit ${GITHUB_SHA}*
+          EOF

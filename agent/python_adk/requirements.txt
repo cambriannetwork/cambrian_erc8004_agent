@@ -1,0 +1,16 @@
+# Google ADK + MCP Integration Requirements
+
+# Core Google ADK packages (correct package names from reference)
+# Using latest version which may have schema validation fixes
+google-adk>=1.15.1
+google-generativeai>=0.8.5
+
+# HTTP client for MCP communication
+aiohttp>=3.9.0
+
+# Flask web server for Node.js integration
+Flask>=3.0.0
+flask-cors>=4.0.0
+
+# Additional dependencies
+pydantic>=2.0.0

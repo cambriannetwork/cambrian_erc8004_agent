@@ -1,0 +1,62 @@
+# Security - Never commit these files
+.env
+.env.local
+.env.production
+*.key
+*.pem
+*-key.json
+service-account*.json
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build artifacts
+dist/
+build/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Evidence (contains sensitive execution data)
+evidence/
+*.evidence.json
+
+# Temp
+tmp/
+temp/
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Archives
+archive/
+
+# macOS
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/

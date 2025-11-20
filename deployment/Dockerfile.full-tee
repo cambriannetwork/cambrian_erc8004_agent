@@ -1,0 +1,202 @@
+# ERC-8004 Full TEE Agent for GCP Confidential Space
+# v6: Complete execution in hardware-isolated environment
+#
+# This Dockerfile creates a TEE container where ALL execution happens in
+# hardware-isolated memory (AMD SEV). The Node.js agent runs entirely within
+# the TEE, making API calls, processing data, and creating proofs - all under
+# hardware attestation.
+#
+# Security Properties:
+# - Proves exact code version executed
+# - Proves API calls to legitimate Cambrian endpoint
+# - Proves data not fabricated or tampered with
+# - Prevents all identified attack vectors
+
+# ============================================================================
+# Build Arguments for Source Verification
+# ============================================================================
+# These args are set during build time and embedded in the container
+# They enable complete source code reproducibility verification
+
+ARG SOURCE_DATE_EPOCH=0
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=0
+ARG BUILD_NUMBER=0
+ARG GIT_REPOSITORY=unknown
+
+# ============================================================================
+# Stage 1: Build Go bootstrap supervisor
+# ============================================================================
+FROM golang:1.21-alpine AS go-builder
+
+# Install build dependencies
+RUN apk add --no-cache git make build-base ca-certificates
+
+WORKDIR /build
+
+# Copy go module files
+COPY deployment/go.mod deployment/go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY deployment/*.go ./
+COPY deployment/config.json ./
+
+# Build bootstrap with reproducible flags
+# - CGO_ENABLED=0: Static binary, no C dependencies
+# - -buildid="": Deterministic builds
+# - -trimpath: Remove local file paths
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags="-w -s -buildid=" \
+    -trimpath \
+    -o /bootstrap \
+    ./bootstrap.go
+
+# ============================================================================
+# Stage 2: Build Node.js agent dependencies
+# ============================================================================
+FROM node:18-alpine AS node-builder
+
+WORKDIR /app
+
+# Copy package files
+COPY agent/package*.json ./
+
+# Install production dependencies only
+# --legacy-peer-deps: Resolve peer dependency conflicts
+# --ignore-scripts: Skip post-install scripts for security
+RUN npm ci --only=production --legacy-peer-deps --ignore-scripts
+
+# Copy agent source code
+COPY agent/cambrian-defi-data-agent.js ./
+COPY agent/ipfs-storage.js ./
+COPY agent/verify-proof.js ./
+COPY agent/dual-tee-proof-generator.js ./
+
+# Create .env.tee template
+RUN echo "# TEE Environment Configuration" > .env.tee && \
+    echo "TEE_MODE=true" >> .env.tee && \
+    echo "NODE_ENV=production" >> .env.tee
+
+# ============================================================================
+# Stage 3: Build Python ADK dependencies
+# ============================================================================
+FROM python:3.11-alpine AS python-builder
+
+WORKDIR /python_adk
+
+# Install build dependencies for Python packages
+RUN apk add --no-cache \
+    gcc \
+    musl-dev \
+    linux-headers \
+    libffi-dev \
+    openssl-dev \
+    cargo \
+    rust
+
+# Copy Python requirements
+COPY agent/python_adk/requirements.txt ./
+
+# Install Python dependencies
+# Use --no-cache-dir to reduce image size
+RUN pip3 install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir -r requirements.txt
+
+# Copy Python ADK source files
+COPY agent/python_adk/ ./
+
+# ============================================================================
+# Stage 4: Production TEE container
+# ============================================================================
+FROM alpine:3.22
+
+# Re-declare build args for this stage
+ARG GIT_COMMIT=unknown
+ARG GIT_BRANCH=unknown
+ARG BUILD_TIMESTAMP=0
+ARG BUILD_NUMBER=0
+ARG GIT_REPOSITORY=unknown
+
+# Set build metadata as environment variables
+# These will be available to the Node.js agent for source verification
+ENV GIT_COMMIT=${GIT_COMMIT} \
+    GIT_BRANCH=${GIT_BRANCH} \
+    BUILD_TIMESTAMP=${BUILD_TIMESTAMP} \
+    BUILD_NUMBER=${BUILD_NUMBER} \
+    GIT_REPOSITORY=${GIT_REPOSITORY}
+
+# Confidential Space metadata labels
+# These labels are enforced by GCP and cannot be overridden
+LABEL "tee.launch_policy.allow_cmd_override"="false"
+LABEL "tee.launch_policy.log_redirect"="always"
+LABEL "tee.launch_policy.allow_env_override"="AGENT_ID,AGENT_DOMAIN,CAMBRIAN_API_KEY,RPC_URL,BASE_SEPOLIA_RPC,CHAIN_ID,SELLER_PRIVATE_KEY,BUYER_PRIVATE_KEY,PINATA_API_KEY,PINATA_SECRET_KEY,TEE_MODE,NODE_ENV,CONTAINER_DIGEST,BYPASS_PAYMENT,GCP_PROJECT_ID,PINATA_GATEWAY,PINATA_GATEWAY_KEY,GEMINI_API_KEY,MCP_SERVER_URL,SERVER_CAMBRIAN_API_KEY,IDENTITY_REGISTRY,REPUTATION_REGISTRY,VALIDATION_REGISTRY"
+
+# Install runtime dependencies
+# - nodejs: For running the Node.js agent
+# - npm: For Node.js package management
+# - ca-certificates: For TLS/HTTPS connections
+# - Python runtime dependencies (matching python:3.11-alpine base)
+RUN apk add --no-cache \
+    nodejs \
+    npm \
+    ca-certificates \
+    libstdc++ \
+    libffi \
+    libgcc \
+    libc6-compat \
+    readline \
+    sqlite-libs \
+    ncurses-libs \
+    openssl \
+    zlib && \
+    # Create non-root user for security
+    addgroup -g 1000 teeagent && \
+    adduser -D -u 1000 -G teeagent teeagent
+
+# Copy Go bootstrap supervisor from builder
+COPY --from=go-builder /bootstrap /bootstrap
+COPY --from=go-builder /build/config.json /config.json
+
+# Copy Node.js agent from builder
+COPY --from=node-builder /app /app
+
+# Copy Python ADK installation from python-builder
+# Copy entire Python installation to ensure all dependencies are available
+COPY --from=python-builder /usr/local/lib/python3.11 /usr/local/lib/python3.11
+COPY --from=python-builder /usr/local/lib/libpython3.11.so* /usr/local/lib/
+COPY --from=python-builder /usr/local/bin/python* /usr/local/bin/
+COPY --from=python-builder /usr/local/bin/pip* /usr/local/bin/
+COPY --from=python-builder /python_adk /app/python_adk
+
+# Set PYTHONPATH and LD_LIBRARY_PATH to ensure Python can find installed packages and shared libraries
+ENV PYTHONPATH=/usr/local/lib/python3.11/site-packages:$PYTHONPATH \
+    LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH \
+    PATH=/usr/local/bin:$PATH
+
+# Create required directories
+RUN mkdir -p /app/evidence && \
+    mkdir -p /app/logs && \
+    chown -R teeagent:teeagent /app
+
+# NOTE: Do NOT set USER here - bootstrap must run as root to access Unix socket
+# Bootstrap will exec into Node.js which will run as the container's default user
+# USER teeagent:teeagent  # COMMENTED OUT - bootstrap needs root for socket access
+
+WORKDIR /app
+
+# Expose agent API port
+EXPOSE 8080
+
+# Health check to verify agent is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+
+# Entry point is the Go bootstrap supervisor
+# This cannot be overridden in Confidential Space
+ENTRYPOINT ["/bootstrap"]
+
+# Default arguments for bootstrap
+# The bootstrap will launch the Node.js agent internally
+CMD ["--config=/config.json", "--port=8080"]

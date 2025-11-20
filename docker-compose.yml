@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  # Python ADK standalone service for local testing
+  python-adk:
+    build:
+      context: .
+      dockerfile: Dockerfile.python-adk
+    ports:
+      - "9000:9000"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SERVER_CAMBRIAN_API_KEY=${SERVER_CAMBRIAN_API_KEY:-${CAMBRIAN_API_KEY}}
+      - PYTHON_ADK_PORT=9000
+      - PYTHON_ADK_HOST=0.0.0.0
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    volumes:
+      - ./logs:/tmp
+
+  # Full agent service (Node.js + Python ADK subprocess)
+  agent:
+    build:
+      context: .
+      dockerfile: deployment/Dockerfile.full-tee
+      args:
+        SOURCE_DATE_EPOCH: 0
+        GIT_COMMIT: local-dev
+        GIT_BRANCH: local
+        BUILD_TIMESTAMP: 0
+        BUILD_NUMBER: 0
+        GIT_REPOSITORY: local
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - SERVER_CAMBRIAN_API_KEY=${SERVER_CAMBRIAN_API_KEY:-${CAMBRIAN_API_KEY}}
+      - CAMBRIAN_API_KEY=${CAMBRIAN_API_KEY}
+      - MCP_SERVER_URL=${MCP_SERVER_URL:-http://136.115.87.101:8081/mcp}
+      - TEE_MODE=false
+      - NODE_ENV=development
+      - BYPASS_PAYMENT=true
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    volumes:
+      - ./logs:/app/logs
+      - ./evidence:/app/evidence
+    depends_on:
+      - python-adk
