@@ -139,30 +139,6 @@ curl -X POST http://localhost:8080/api/price-current \
 
 ---
 
-## Smart Contracts (Base Sepolia)
-
-### Enhanced Implementation (Recommended)
-
-```
-ERC8004Complete:           0x8647e26A4baA3C3D81a5e9612F9C191ec20f5372
-ReputationRegistryV2:      0x701C8B6431aD0C4670E8F27AD4cE9aEb8a135ffd
-ValidationRegistryV2:      0xb4CaE4D7ee3b27A1577308aFDeaee9012FB8374b
-ProofRegistryV2:           0x497f2f7081673236af8B2924E673FdDB7fAeF889
-ServiceExecutionRegistry:  0x1a32B3ABE438A2b4e4D1E183d2de9feAf9Ac1181
-```
-
-### Official ERC-8004 v1.0 (Strict Spec Compliance)
-
-```
-IdentityRegistryV1:   0x7177a6867296406881E20d6647232314736Dd09A
-ReputationRegistryV1: 0xB5048e3ef1DA4E04deB6f7d0423D06F63869e322
-ValidationRegistryV1: 0x662b40A526cb4017d947e71eAF6753BF3eeE66d8
-```
-
-All contracts indexed by [The Graph subgraph](https://github.com/your-org/erc_8004_subgraph).
-
----
-
 ## New ERC-8004 Features
 
 ### 1. FeedbackAuth Signatures (EIP-712)
@@ -304,23 +280,6 @@ await agent.generateValidationRequestURI(validator, input, output);
 
 ---
 
-## Integration with UI & Subgraph
-
-This agent is part of a complete ERC-8004 ecosystem:
-
-1. **UI Dashboard** ([cambrian_erc8004_ui](https://github.com/your-org/cambrian_erc8004_ui))
-   - Browse agents
-   - Submit feedback
-   - Request validation
-   - View reputation
-
-2. **Subgraph** ([erc_8004_subgraph](https://github.com/your-org/erc_8004_subgraph))
-   - Indexes all registries
-   - GraphQL API
-   - Real-time activity feed
-
----
-
 ## Environment Variables
 
 ### Required
@@ -387,15 +346,6 @@ node agent/verify-proof.js PROOF_ID
 
 ---
 
-## Documentation
-
-- **ERC-8004 Spec**: https://eips.ethereum.org/EIPS/eip-8004
-- **UI Repository**: [cambrian_erc8004_ui](https://github.com/your-org/cambrian_erc8004_ui)
-- **Subgraph Repository**: [erc_8004_subgraph](https://github.com/your-org/erc_8004_subgraph)
-- **Cambrian Network**: https://cambrian.network
-
----
-
 ## Contributing
 
 1. Fork the repository
@@ -412,22 +362,7 @@ MIT License - See LICENSE file for details
 
 ---
 
-## Support
-
-- **Issues**: [GitHub Issues](https://github.com/your-org/cambrian_erc8004_agent/issues)
-- **Documentation**: [Wiki](https://github.com/your-org/cambrian_erc8004_agent/wiki)
-- **Email**: support@cambrian.network
-
----
-
-**Version**: 2.0.0
-**Status**: ✅ Production Ready
-**Last Updated**: October 2025
-**ERC-8004 Compliance**: 100%
-
----
-
-## 🔒 Security Improvements (December 2025)
+## 🔒 Security Improvements
 
 ### Critical Updates
 
